@@ -38,7 +38,7 @@ def max_homopolymer(seq: str) -> int:
     return max_run
 
 
-def low_complexity_fraction(seq: str, k: int = 2) -> float:
+def low_complexity_fraction(seq: str, k: int = 3) -> float:
     seq = seq.upper()
     if len(seq) < k:
         return 0.0
@@ -62,10 +62,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-tsv", required=True)
     ap.add_argument("--window", type=int, default=80)
     ap.add_argument("--step", type=int, default=10)
-    ap.add_argument("--min-gc", type=float, default=0.35)
-    ap.add_argument("--max-gc", type=float, default=0.60)
-    ap.add_argument("--max-homopolymer", type=int, default=5)
-    ap.add_argument("--max-low-complexity", type=float, default=0.70)
+    ap.add_argument("--min-gc", type=float, default=0.22)
+    ap.add_argument("--max-gc", type=float, default=0.68)
+    ap.add_argument("--max-homopolymer", type=int, default=7)
+    ap.add_argument("--max-low-complexity", type=float, default=0.88,
+                    help="Upper bound on low-complexity fraction. RSVB defaults are intentionally relaxed and k=3-based.")
     return ap.parse_args()
 
 
@@ -85,7 +86,7 @@ def main() -> None:
         window_seq = seq[start0:end0]
         gc = gc_fraction(window_seq)
         max_hp = max_homopolymer(window_seq)
-        lc = low_complexity_fraction(window_seq)
+        lc = low_complexity_fraction(window_seq, k=3)
         tm_est = wallace_tm(window_seq)
 
         keep = True
@@ -118,6 +119,7 @@ def main() -> None:
                 "low_complexity_fraction": round(lc, 6),
                 "candidate_keep": keep,
                 "candidate_fail_reason": ";".join(fail_reasons),
+                "candidate_passes_relaxed_rsvb_defaults": keep,
             }
         )
 
