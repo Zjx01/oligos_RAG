@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Score candidate binding sites for conservation and mismatch-robustness.
+"""Score candidate sites for conservation / mismatch robustness.
 
-Assumptions for initial MVP:
-- alignment FASTA includes the same reference sequence used for candidate generation
-- reference ID is supplied with --ref-id
-- reference coordinates are mapped onto alignment columns using non-gap positions
+Supports two modes:
+- capture_long: legacy long-bait scoring
+- rt_primer_25: short RT-primer-aware scoring with emphasis on the 3' end
 """
 from __future__ import annotations
 
@@ -66,12 +65,29 @@ def normalize_entropy(ent: float, max_ent: float = 2.0) -> float:
     return min(max(ent / max_ent, 0.0), 1.0)
 
 
+def exact_suffix_len(seq: str, ref: str) -> int:
+    n = min(len(seq), len(ref))
+    count = 0
+    for i in range(1, n + 1):
+        a = seq[-i].upper()
+        b = ref[-i].upper()
+        if a not in VALID_BASES:
+            break
+        if a == b:
+            count += 1
+        else:
+            break
+    return count
+
+
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Score RSVB candidates for conservation")
+    ap = argparse.ArgumentParser(description="Score candidates for conservation")
     ap.add_argument("--alignment-fasta", required=True)
     ap.add_argument("--ref-id", required=True)
     ap.add_argument("--candidates-tsv", required=True)
     ap.add_argument("--output-tsv", required=True)
+    ap.add_argument("--assay-type", choices=["capture_long", "rt_primer_25"], default="rt_primer_25")
+    ap.add_argument("--three-prime-nt", type=int, default=8)
     return ap.parse_args()
 
 
@@ -94,12 +110,14 @@ def main() -> None:
         end = int(row["end"])
         ref_window = str(row["sequence_ref"]).upper()
         cols = [ref_map[pos] for pos in range(start, end + 1)]
+        three_prime_nt = min(int(args.three_prime_nt), len(ref_window))
 
         col_entropies = []
         valid_windows = 0
-        cov0 = 0
-        cov1 = 0
-        cov2 = 0
+        cov0 = cov1 = cov2 = 0
+        cov_80pct = cov_90pct = 0
+        cov_3p0 = cov_3p1 = cov_terminal = 0
+        suffix_fracs: List[float] = []
 
         for aln_col in cols:
             chars = [seq[aln_col] for seq in aligned_sequences]
@@ -118,19 +136,68 @@ def main() -> None:
             if mism <= 2:
                 cov2 += 1
 
-        cov0mm = cov0 / valid_windows if valid_windows else 0.0
-        cov1mm = cov1 / valid_windows if valid_windows else 0.0
-        cov2mm = cov2 / valid_windows if valid_windows else 0.0
+            identity = 1.0 - (mism / len(ref_window))
+            if identity >= 0.80:
+                cov_80pct += 1
+            if identity >= 0.90:
+                cov_90pct += 1
+
+            seq_3p = window_aln.replace("-", "")[-three_prime_nt:]
+            ref_3p = ref_window[-three_prime_nt:]
+            mism_3p = 0
+            valid_3p = True
+            for a, b in zip(seq_3p, ref_3p):
+                if a not in VALID_BASES:
+                    valid_3p = False
+                    break
+                if a != b:
+                    mism_3p += 1
+            if valid_3p:
+                if mism_3p == 0:
+                    cov_3p0 += 1
+                if mism_3p <= 1:
+                    cov_3p1 += 1
+                if seq_3p[-1] == ref_3p[-1]:
+                    cov_terminal += 1
+                suffix_fracs.append(exact_suffix_len(seq_3p, ref_3p) / max(len(ref_3p), 1))
+
+        denom = valid_windows if valid_windows else 1
+        cov0mm = cov0 / denom
+        cov1mm = cov1 / denom
+        cov2mm = cov2 / denom
+        cov80 = cov_80pct / denom
+        cov90 = cov_90pct / denom
+        cov3p0 = cov_3p0 / denom
+        cov3p1 = cov_3p1 / denom
+        covterm = cov_terminal / denom
+        mean_suffix_frac = sum(suffix_fracs) / len(suffix_fracs) if suffix_fracs else 0.0
         ent_mean = sum(col_entropies) / len(col_entropies) if col_entropies else 0.0
         ent_max = max(col_entropies) if col_entropies else 0.0
 
-        robustness = max(
-            0.0,
-            min(
-                1.0,
-                (0.5 * cov1mm + 0.5 * cov2mm) - 0.15 * normalize_entropy(ent_mean) - 0.10 * normalize_entropy(ent_max),
-            ),
-        )
+        if args.assay_type == "rt_primer_25":
+            robustness = max(
+                0.0,
+                min(
+                    1.0,
+                    0.22 * cov0mm
+                    + 0.18 * cov1mm
+                    + 0.20 * cov3p0
+                    + 0.15 * cov3p1
+                    + 0.10 * covterm
+                    + 0.10 * mean_suffix_frac
+                    + 0.05 * cov90
+                    - 0.08 * normalize_entropy(ent_mean)
+                    - 0.04 * normalize_entropy(ent_max),
+                ),
+            )
+        else:
+            robustness = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.5 * cov1mm + 0.5 * cov2mm) - 0.15 * normalize_entropy(ent_mean) - 0.10 * normalize_entropy(ent_max),
+                ),
+            )
 
         out = row.to_dict()
         out.update(
@@ -138,6 +205,12 @@ def main() -> None:
                 "cov_0mm": round(cov0mm, 6),
                 "cov_1mm": round(cov1mm, 6),
                 "cov_2mm": round(cov2mm, 6),
+                "cov_80pct": round(cov80, 6),
+                "cov_90pct": round(cov90, 6),
+                "cov_3p_0mm": round(cov3p0, 6),
+                "cov_3p_1mm": round(cov3p1, 6),
+                "cov_terminal_match": round(covterm, 6),
+                "mean_exact_3p_suffix_frac": round(mean_suffix_frac, 6),
                 "entropy_mean": round(ent_mean, 6),
                 "entropy_max": round(ent_max, 6),
                 "valid_alignment_windows": valid_windows,
@@ -150,6 +223,7 @@ def main() -> None:
     Path(args.output_tsv).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(args.output_tsv, sep="\t", index=False)
     print(f"Scored {len(out_df)} candidate sites for conservation")
+    print(f"Assay type: {args.assay_type}")
     print(f"Wrote -> {args.output_tsv}")
 
 
