@@ -86,7 +86,7 @@ rule qc_rsvb:
     conda:
         "envs/python_bio.yaml"
     shell:
-        """
+        r"""
         mkdir -p {QC_DIR} {LOG_DIR}
         python scripts/qc_rsvb.py \
           --input-fasta {input.fasta} \
@@ -109,11 +109,11 @@ rule combine_ref_and_clean:
     run:
         Path(ALN_DIR).mkdir(parents=True, exist_ok=True)
         Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
-        with open(output[0], 'wb') as out:
+        with open(output[0], "wb") as out:
             for fp in [input.ref, input.clean]:
-                with open(fp, 'rb') as fh:
+                with open(fp, "rb") as fh:
                     out.write(fh.read())
-        with open(log[0], 'w') as lg:
+        with open(log[0], "w") as lg:
             lg.write(f"Wrote combined FASTA -> {output[0]}\n")
 
 
@@ -125,13 +125,13 @@ rule mafft_align:
     log:
         f"{LOG_DIR}/mafft_align.log",
     threads: lambda wc: int(config["threads"].get("mafft", 4))
-    conda:
-        "envs/mafft.yaml"
     resources:
         mem_mb=16000,
         time_min=240,
+    conda:
+        "envs/mafft.yaml"
     shell:
-        """
+        r"""
         mkdir -p {ALN_DIR} {LOG_DIR}
         {config[alignment][mafft_bin]} {config[alignment][mafft_args]} --thread {threads} {input} > {output} 2> {log}
         """
@@ -153,7 +153,7 @@ rule generate_candidates:
     params:
         require_terminal=lambda wc: bool_flag(config["candidates"].get("require_terminal_matchable_base", True), "--require-terminal-matchable-base"),
     shell:
-        """
+        r"""
         mkdir -p {CAND_DIR} {LOG_DIR}
         python scripts/generate_candidates.py \
           --ref-fasta {input.ref} \
@@ -191,7 +191,7 @@ rule score_conservation:
     conda:
         "envs/python_bio.yaml"
     shell:
-        """
+        r"""
         mkdir -p {CONS_DIR} {LOG_DIR}
         python scripts/score_conservation.py \
           --alignment-fasta {input.aln} \
@@ -246,7 +246,8 @@ rule rnaplfold:
         test -n "$lunp"
         cp "$lunp" "$out_lunp"
         """
-        
+
+
 rule score_accessibility:
     input:
         cand=CONSERVATION_TSV,
@@ -262,7 +263,7 @@ rule score_accessibility:
     conda:
         "envs/python_bio.yaml"
     shell:
-        """
+        r"""
         mkdir -p {ACC_DIR} {LOG_DIR}
         python scripts/score_accessibility.py \
           --candidates-tsv {input.cand} \
@@ -291,8 +292,10 @@ rule score_specificity:
     params:
         optional=lambda wc: specificity_optional_args(),
     shell:
-        """
+        r"""
+        set -euo pipefail
         mkdir -p {SPEC_DIR} {LOG_DIR}
+
         python scripts/score_specificity.py \
           --candidates-tsv {input} \
           --output-tsv {output} \
@@ -329,7 +332,7 @@ rule select_panel:
     conda:
         "envs/python_bio.yaml"
     shell:
-        """
+        r"""
         mkdir -p {PANEL_DIR} {LOG_DIR}
         python scripts/select_panel.py \
           --scored-tsv {input} \
