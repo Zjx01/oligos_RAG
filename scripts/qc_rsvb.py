@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-fasta", required=True, help="Cleaned FASTA output")
     ap.add_argument("--qc-tsv", required=True, help="QC summary TSV")
     ap.add_argument("--min-length", type=int, default=14500)
-    ap.add_argument("--max-n-fraction", type=float, default=0.01)
+    ap.add_argument("--max-n-fraction", type=float, default=0.02)
     return ap.parse_args()
 
 

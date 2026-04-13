@@ -1,0 +1,97 @@
+# Snakemake 7.32.0-compatible configuration for oligos_RAG RT25 workflow
+
+assay_type: rt_primer_25
+output_dir: results
+
+input:
+  genomes_fasta: data/RSVB_genome.fasta
+  ref_fasta: data/PP_002W6UA.1.fa
+  ref_id: PP_002W6UA.1
+
+threads:
+  mafft: 8
+  specificity: 8
+
+qc:
+  min_length: 14500
+  max_n_fraction: 0.02
+
+alignment:
+  mafft_bin: mafft
+  mafft_args: --auto
+
+candidates:
+  window: 25
+  step: 1
+  min_gc: 0.32
+  max_gc: 0.64
+  max_homopolymer: 4
+  max_low_complexity: 0.80
+  low_complexity_k: 3
+  min_tm: 52
+  max_tm: 66
+  min_gc_3p5: 1
+  max_gc_3p5: 4
+  max_3p_homopolymer: 3
+  require_terminal_matchable_base: true
+
+conservation:
+  three_prime_nt: 8
+
+accessibility:
+  rnaplfold_bin: RNAplfold
+  plfold_window: 150
+  plfold_max_span: 100
+  u_length: 8
+  three_prime_nt: 8
+  plfold_no_lp: false
+
+specificity:
+  blastn_bin: blastn
+  task: auto
+  word_size: 7
+  evalue: 1000.0
+  max_target_seqs: 10
+  max_hsps: 1
+  min_pident: 80
+  min_query_cover: 0.80
+  three_prime_anchor_nt: 8
+  ungapped: auto
+  blast_perc_identity: auto
+  # Use the BLAST database PREFIX
+  # Example: /lustre/home/zhaoj11/databases/blastdb_human/human_bg
+  human_blast_db_prefix: "/lustre/home/zhaoj11/databases/blastdb_human/human_bg"
+  # Leave empty to skip respiratory virus background
+  virus_blast_db_prefix: ""
+  # Optional: use precomputed TSVs instead of running blastn inside the rule
+  human_blast_tsv: ""
+  virus_blast_tsv: ""
+  mfeprimer_tsv: ""
+  cache_dir: results/06_specificity/.blast_cache
+
+panel:
+  max_sites: 24
+  min_site_score: 0.56
+  min_gap: 250
+  hard_min_gap: 40
+  max_overlap_fraction: 0.20
+  min_new_bp: 12
+  cross_penalty_weight: 0.22
+  cross_penalty_sum_weight: 0.08
+  safe_run: 6
+  risky_run: 9
+  safe_terminal_run: 3
+  risky_terminal_run: 5
+  safe_match_fraction: 0.50
+  risky_match_fraction: 0.75
+  hard_max_terminal_run: 7
+  hard_max_run: 10
+  min_accessibility_score: 0.10
+  min_access_3p_terminal: 0.15
+  min_robustness_score: 0.90
+  min_cov_3p_1mm: 0.95
+  min_cov_terminal_match: 0.95
+  max_human_hits: 10
+  max_human_anchored_hits: 0
+  max_human_nearperfect_hits: 0
+  max_virus_anchored_hits: 0

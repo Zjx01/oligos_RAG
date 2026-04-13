@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """Attach off-target / specificity scores to candidate sites.
 
-This version keeps the original BLAST-driven workflow but adds short-primer-aware
-summary fields for rt_primer_25, especially 3'-anchored host hits.
+Speed-oriented update:
+- deduplicates identical candidate sequences before BLAST
+- optionally caches BLAST result TSVs
+- uses faster BLAST defaults for rt_primer_25
+- pushes identity filtering into BLAST when possible
+- supports ungapped mode for short primer searches
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import pandas as pd
 from Bio import SeqIO
@@ -24,6 +30,18 @@ BLAST_COLUMNS = [
     "qseqid", "sseqid", "pident", "length", "mismatch", "gapopen", "qstart", "qend",
     "sstart", "send", "evalue", "bitscore", "qlen", "slen",
 ]
+EMPTY_SUMMARY_COLUMNS = [
+    "query_id", "hits", "best_pident", "best_qcov",
+    "anchored_hits", "best_anchored_pident", "best_anchored_qcov",
+    "nearperfect_hits",
+]
+
+
+def _clean_optional_string(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    sval = str(value).strip()
+    return sval if sval else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,12 +54,21 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--task", default="auto", help="auto, blastn, or blastn-short")
     ap.add_argument("--word-size", type=int, default=None)
     ap.add_argument("--evalue", type=float, default=1000.0)
-    ap.add_argument("--max-target-seqs", type=int, default=50)
+    ap.add_argument("--max-target-seqs", type=int, default=None)
+    ap.add_argument("--max-hsps", type=int, default=None)
     ap.add_argument("--num-threads", type=int, default=1)
     ap.add_argument("--min-pident", type=float, default=None)
     ap.add_argument("--min-query-cover", type=float, default=None)
     ap.add_argument("--three-prime-anchor-nt", type=int, default=8)
     ap.add_argument("--query-fasta", default=None)
+    ap.add_argument("--ungapped", choices=["auto", "yes", "no"], default="auto",
+                    help="Use ungapped BLAST alignments. Default: auto (yes for rt_primer_25)")
+    ap.add_argument("--blast-perc-identity", choices=["auto", "yes", "no"], default="auto",
+                    help="Pass -perc_identity to blastn. Default: auto (yes when min-pident is set)")
+    ap.add_argument("--cache-dir", default=None,
+                    help="Directory for caching BLAST TSVs. Default: <output dir>/.blast_cache")
+    ap.add_argument("--no-deduplicate-queries", action="store_true",
+                    help="Disable deduplication of identical candidate sequences before BLAST")
 
     ap.add_argument("--human-blast-db", default=None)
     ap.add_argument("--virus-blast-db", default=None)
@@ -65,22 +92,100 @@ def resolve_defaults(args: argparse.Namespace, query_lengths: List[int]) -> None
     if args.min_pident is None:
         args.min_pident = 80.0 if args.assay_type == "rt_primer_25" else 85.0
     if args.min_query_cover is None:
-        args.min_query_cover = 0.80 if args.assay_type == "rt_primer_25" else 0.80
+        args.min_query_cover = 0.80
+    if args.max_target_seqs is None:
+        args.max_target_seqs = 10 if args.assay_type == "rt_primer_25" else 50
+    if args.max_hsps is None:
+        args.max_hsps = 1 if args.assay_type == "rt_primer_25" else 0  # 0 => omit
+    if args.cache_dir is None:
+        args.cache_dir = str(Path(args.output_tsv).resolve().parent / ".blast_cache")
 
 
-def write_query_fasta_from_candidates(df: pd.DataFrame, fasta_path: str) -> None:
+def validate_db_prefix(db: str) -> None:
+    p = Path(db).expanduser()
+    if p.is_dir():
+        files = sorted(x.name for x in p.iterdir())[:10]
+        raise SystemExit(
+            f"--blast-db expects a BLAST database prefix, not a directory: {db}\n"
+            f"Directory preview: {files}\n"
+            f"Example of correct value: {p / 'human_bg'}"
+        )
+
+
+def build_query_table(df: pd.DataFrame, deduplicate: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
     required = {"site_id", "sequence_ref"}
     if not required.issubset(df.columns):
         raise SystemExit(f"Candidates TSV must contain columns: {sorted(required)}")
-    records = [SeqRecord(Seq(str(row.sequence_ref).upper()), id=str(row.site_id), description="") for row in df.itertuples(index=False)]
+    q = df[["site_id", "sequence_ref"]].copy()
+    q["sequence_ref"] = q["sequence_ref"].astype(str).str.upper()
+    q["query_len"] = q["sequence_ref"].str.len()
+    if deduplicate:
+        uniq = q[["sequence_ref", "query_len"]].drop_duplicates().reset_index(drop=True)
+        uniq["query_id"] = [f"Q{i:06d}" for i in range(1, len(uniq) + 1)]
+        mapping = q.merge(uniq, on=["sequence_ref", "query_len"], how="left")
+        return mapping, uniq[["query_id", "sequence_ref", "query_len"]]
+    else:
+        q = q.copy()
+        q["query_id"] = q["site_id"].astype(str)
+        return q[["site_id", "sequence_ref", "query_len", "query_id"]], q[["query_id", "sequence_ref", "query_len"]]
+
+
+def write_query_fasta(query_df: pd.DataFrame, fasta_path: str) -> None:
+    records = [
+        SeqRecord(Seq(seq), id=str(qid), description="")
+        for qid, seq in zip(query_df["query_id"], query_df["sequence_ref"])
+    ]
     Path(fasta_path).parent.mkdir(parents=True, exist_ok=True)
     SeqIO.write(records, fasta_path, "fasta")
 
 
-def run_blast(query_fasta: str, db: str, out_path: str, args: argparse.Namespace, query_lengths: List[int]) -> None:
+def blast_cache_key(db: str, args: argparse.Namespace, query_df: pd.DataFrame) -> str:
+    payload = {
+        "db": str(Path(db).expanduser()),
+        "assay_type": args.assay_type,
+        "task": choose_blast_task(args.task, query_df["query_len"].tolist()),
+        "word_size": args.word_size,
+        "evalue": args.evalue,
+        "max_target_seqs": args.max_target_seqs,
+        "max_hsps": args.max_hsps,
+        "min_pident": args.min_pident,
+        "min_query_cover": args.min_query_cover,
+        "three_prime_anchor_nt": args.three_prime_anchor_nt,
+        "ungapped": args.ungapped,
+        "blast_perc_identity": args.blast_perc_identity,
+        "queries": list(zip(query_df["query_id"], query_df["sequence_ref"])),
+    }
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def should_use_ungapped(args: argparse.Namespace) -> bool:
+    if args.ungapped == "yes":
+        return True
+    if args.ungapped == "no":
+        return False
+    return args.assay_type == "rt_primer_25"
+
+
+def should_pass_perc_identity(args: argparse.Namespace) -> bool:
+    if args.blast_perc_identity == "yes":
+        return True
+    if args.blast_perc_identity == "no":
+        return False
+    return args.min_pident is not None
+
+
+def run_blast(
+    query_fasta: str,
+    query_df: pd.DataFrame,
+    db: str,
+    out_path: str,
+    args: argparse.Namespace,
+) -> None:
     if shutil.which(args.blastn_bin) is None:
         raise SystemExit(f"blastn binary not found: {args.blastn_bin}")
-    task = choose_blast_task(args.task, query_lengths)
+    validate_db_prefix(db)
+    task = choose_blast_task(args.task, query_df["query_len"].tolist())
     cmd = [
         args.blastn_bin,
         "-query", query_fasta,
@@ -94,6 +199,13 @@ def run_blast(query_fasta: str, db: str, out_path: str, args: argparse.Namespace
         "-outfmt", BLAST_OUTFMT,
         "-out", out_path,
     ]
+    if args.max_hsps and args.max_hsps > 0:
+        cmd.extend(["-max_hsps", str(args.max_hsps)])
+    if should_use_ungapped(args):
+        cmd.append("-ungapped")
+    if should_pass_perc_identity(args) and args.min_pident is not None:
+        cmd.extend(["-perc_identity", str(args.min_pident)])
+
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode != 0:
         raise SystemExit(
@@ -105,62 +217,71 @@ def run_blast(query_fasta: str, db: str, out_path: str, args: argparse.Namespace
 
 
 def load_blast_hits(blast_tsv: str) -> pd.DataFrame:
-    if Path(blast_tsv).stat().st_size == 0:
+    if not blast_tsv or not Path(blast_tsv).exists() or Path(blast_tsv).stat().st_size == 0:
         return pd.DataFrame(columns=BLAST_COLUMNS)
     return pd.read_csv(blast_tsv, sep="\t", names=BLAST_COLUMNS, comment="#", header=None)
 
 
-def summarize_blast_hits(blast_tsv: Optional[str], min_pident: float, min_query_cover: float, prefix: str, three_prime_anchor_nt: int) -> pd.DataFrame:
+def summarize_blast_hits_query_level(
+    blast_tsv: Optional[str],
+    min_pident: float,
+    min_query_cover: float,
+    three_prime_anchor_nt: int,
+) -> pd.DataFrame:
     if blast_tsv is None:
-        return pd.DataFrame(columns=[
-            "site_id", f"{prefix}_hits", f"{prefix}_best_pident", f"{prefix}_best_qcov",
-            f"{prefix}_anchored_hits", f"{prefix}_best_anchored_pident", f"{prefix}_best_anchored_qcov",
-            f"{prefix}_nearperfect_hits",
-        ])
+        return pd.DataFrame(columns=EMPTY_SUMMARY_COLUMNS)
 
     hits = load_blast_hits(blast_tsv)
     if hits.empty:
-        return pd.DataFrame(columns=[
-            "site_id", f"{prefix}_hits", f"{prefix}_best_pident", f"{prefix}_best_qcov",
-            f"{prefix}_anchored_hits", f"{prefix}_best_anchored_pident", f"{prefix}_best_anchored_qcov",
-            f"{prefix}_nearperfect_hits",
-        ])
+        return pd.DataFrame(columns=EMPTY_SUMMARY_COLUMNS)
 
-    hits["qcov"] = hits["length"].astype(float) / hits["qlen"].replace(0, pd.NA).astype(float)
-    filt = hits[(hits["pident"].astype(float) >= min_pident) & (hits["qcov"] >= min_query_cover)].copy()
+    hits["pident"] = hits["pident"].astype(float)
+    hits["length"] = hits["length"].astype(float)
+    hits["qstart"] = hits["qstart"].astype(int)
+    hits["qend"] = hits["qend"].astype(int)
+    hits["qlen"] = hits["qlen"].astype(float)
+    hits["qcov"] = hits["length"] / hits["qlen"].replace(0, pd.NA).astype(float)
+
+    filt = hits[(hits["pident"] >= min_pident) & (hits["qcov"] >= min_query_cover)].copy()
     if filt.empty:
-        return pd.DataFrame(columns=[
-            "site_id", f"{prefix}_hits", f"{prefix}_best_pident", f"{prefix}_best_qcov",
-            f"{prefix}_anchored_hits", f"{prefix}_best_anchored_pident", f"{prefix}_best_anchored_qcov",
-            f"{prefix}_nearperfect_hits",
-        ])
+        return pd.DataFrame(columns=EMPTY_SUMMARY_COLUMNS)
 
-    filt["anchored"] = (filt["qend"] >= filt["qlen"]) & ((filt["qend"] - filt["qstart"] + 1) >= three_prime_anchor_nt)
+    # Query reaches the 3' end and includes at least three_prime_anchor_nt aligned bases there.
+    filt["anchored"] = (filt["qend"] >= filt["qlen"]) & (((filt["qend"] - filt["qstart"]) + 1) >= three_prime_anchor_nt)
     filt["nearperfect"] = (filt["pident"] >= 92.0) & (filt["qcov"] >= 0.92)
 
-    summary = (
-        filt.groupby("qseqid", as_index=False)
-        .agg(
-            hits=("sseqid", "count"),
-            best_pident=("pident", "max"),
-            best_qcov=("qcov", "max"),
-            anchored_hits=("anchored", "sum"),
-            best_anchored_pident=("pident", lambda s: float(filt.loc[s.index][filt.loc[s.index, "anchored"]]["pident"].max()) if filt.loc[s.index, "anchored"].any() else 0.0),
-            best_anchored_qcov=("qcov", lambda s: float(filt.loc[s.index][filt.loc[s.index, "anchored"]]["qcov"].max()) if filt.loc[s.index, "anchored"].any() else 0.0),
-            nearperfect_hits=("nearperfect", "sum"),
-        )
-        .rename(columns={
-            "qseqid": "site_id",
-            "hits": f"{prefix}_hits",
-            "best_pident": f"{prefix}_best_pident",
-            "best_qcov": f"{prefix}_best_qcov",
-            "anchored_hits": f"{prefix}_anchored_hits",
-            "best_anchored_pident": f"{prefix}_best_anchored_pident",
-            "best_anchored_qcov": f"{prefix}_best_anchored_qcov",
-            "nearperfect_hits": f"{prefix}_nearperfect_hits",
+    rows = []
+    for qid, g in filt.groupby("qseqid", sort=False):
+        anchored = g[g["anchored"]]
+        rows.append({
+            "query_id": qid,
+            "hits": int(len(g)),
+            "best_pident": float(g["pident"].max()),
+            "best_qcov": float(g["qcov"].max()),
+            "anchored_hits": int(g["anchored"].sum()),
+            "best_anchored_pident": float(anchored["pident"].max()) if not anchored.empty else 0.0,
+            "best_anchored_qcov": float(anchored["qcov"].max()) if not anchored.empty else 0.0,
+            "nearperfect_hits": int(g["nearperfect"].sum()),
         })
-    )
-    return summary
+    return pd.DataFrame(rows)
+
+
+def rename_query_summary(summary: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    if summary.empty:
+        return pd.DataFrame(columns=[
+            "query_id", f"{prefix}_hits", f"{prefix}_best_pident", f"{prefix}_best_qcov",
+            f"{prefix}_anchored_hits", f"{prefix}_best_anchored_pident", f"{prefix}_best_anchored_qcov",
+            f"{prefix}_nearperfect_hits",
+        ])
+    return summary.rename(columns={
+        "hits": f"{prefix}_hits",
+        "best_pident": f"{prefix}_best_pident",
+        "best_qcov": f"{prefix}_best_qcov",
+        "anchored_hits": f"{prefix}_anchored_hits",
+        "best_anchored_pident": f"{prefix}_best_anchored_pident",
+        "best_anchored_qcov": f"{prefix}_best_anchored_qcov",
+        "nearperfect_hits": f"{prefix}_nearperfect_hits",
+    })
 
 
 def load_mfeprimer_summary(path: Optional[str]) -> pd.DataFrame:
@@ -207,46 +328,82 @@ def specificity_score_from_row(row: pd.Series, assay_type: str) -> float:
     return max(0.0, 1.0 - penalty)
 
 
+def prepare_blast_tsv(
+    label: str,
+    blast_db: Optional[str],
+    blast_tsv: Optional[str],
+    unique_query_df: pd.DataFrame,
+    args: argparse.Namespace,
+) -> Optional[str]:
+    if blast_tsv:
+        return blast_tsv
+    if not blast_db:
+        return None
+
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = blast_cache_key(blast_db, args, unique_query_df)
+    cached_tsv = cache_dir / f"{label}.{cache_key}.tsv"
+    cached_fasta = cache_dir / f"{label}.{cache_key}.fa"
+
+    if cached_tsv.exists():
+        return str(cached_tsv)
+
+    if args.query_fasta and not args.no_deduplicate_queries:
+        # External query FASTA may not match deduplicated query IDs; only cache FASTA if we created it.
+        pass
+
+    with tempfile.TemporaryDirectory(prefix="specificity_") as td:
+        td_path = Path(td)
+        query_fasta = str(td_path / "queries.fa")
+        write_query_fasta(unique_query_df, query_fasta)
+        run_blast(query_fasta, unique_query_df, blast_db, str(cached_tsv), args)
+        shutil.copyfile(query_fasta, cached_fasta)
+    return str(cached_tsv)
+
+
 def main() -> None:
     args = parse_args()
+    args.human_blast_db = _clean_optional_string(args.human_blast_db)
+    args.virus_blast_db = _clean_optional_string(args.virus_blast_db)
+    args.human_blast_tsv = _clean_optional_string(args.human_blast_tsv)
+    args.virus_blast_tsv = _clean_optional_string(args.virus_blast_tsv)
+    args.mfeprimer_tsv = _clean_optional_string(args.mfeprimer_tsv)
+    args.cache_dir = _clean_optional_string(args.cache_dir)
     df = pd.read_csv(args.candidates_tsv, sep="\t")
+    if "site_id" not in df.columns or "sequence_ref" not in df.columns:
+        raise SystemExit("Candidates TSV must contain site_id and sequence_ref")
+
     query_lengths = [len(str(s)) for s in df.get("sequence_ref", [])]
     resolve_defaults(args, query_lengths)
 
-    tempdir_obj = None
-    query_fasta = args.query_fasta
-    if not query_fasta:
-        tempdir_obj = tempfile.TemporaryDirectory(prefix="specificity_")
-        query_fasta = str(Path(tempdir_obj.name) / "candidates.fa")
-        write_query_fasta_from_candidates(df, query_fasta)
+    mapping_df, unique_query_df = build_query_table(df, deduplicate=not args.no_deduplicate_queries)
 
-    human_blast_tsv = args.human_blast_tsv
-    virus_blast_tsv = args.virus_blast_tsv
+    human_blast_tsv = prepare_blast_tsv("human", args.human_blast_db, args.human_blast_tsv, unique_query_df, args)
+    virus_blast_tsv = prepare_blast_tsv("virus", args.virus_blast_db, args.virus_blast_tsv, unique_query_df, args)
 
-    if args.human_blast_db:
-        if human_blast_tsv is None:
-            if tempdir_obj is None:
-                tempdir_obj = tempfile.TemporaryDirectory(prefix="specificity_")
-            human_blast_tsv = str(Path(tempdir_obj.name) / "human_hits.tsv")
-        run_blast(query_fasta, args.human_blast_db, human_blast_tsv, args, query_lengths)
+    human_query_summary = summarize_blast_hits_query_level(
+        human_blast_tsv, args.min_pident, args.min_query_cover, args.three_prime_anchor_nt
+    )
+    virus_query_summary = summarize_blast_hits_query_level(
+        virus_blast_tsv, args.min_pident, args.min_query_cover, args.three_prime_anchor_nt
+    )
 
-    if args.virus_blast_db:
-        if virus_blast_tsv is None:
-            if tempdir_obj is None:
-                tempdir_obj = tempfile.TemporaryDirectory(prefix="specificity_")
-            virus_blast_tsv = str(Path(tempdir_obj.name) / "virus_hits.tsv")
-        run_blast(query_fasta, args.virus_blast_db, virus_blast_tsv, args, query_lengths)
-
-    human_summary = summarize_blast_hits(human_blast_tsv, args.min_pident, args.min_query_cover, prefix="human_offtarget", three_prime_anchor_nt=args.three_prime_anchor_nt)
-    virus_summary = summarize_blast_hits(virus_blast_tsv, args.min_pident, args.min_query_cover, prefix="virus_bg", three_prime_anchor_nt=args.three_prime_anchor_nt)
-    mfe_summary = load_mfeprimer_summary(args.mfeprimer_tsv)
+    human_query_summary = rename_query_summary(human_query_summary, "human_offtarget")
+    virus_query_summary = rename_query_summary(virus_query_summary, "virus_bg")
 
     out = df.copy()
-    for summary in [human_summary, virus_summary, mfe_summary]:
-        if not summary.empty:
-            out = out.merge(summary, on="site_id", how="left")
+    out = out.merge(mapping_df[["site_id", "query_id"]], on="site_id", how="left")
 
-    for col in [
+    for summary in [human_query_summary, virus_query_summary]:
+        if not summary.empty:
+            out = out.merge(summary, on="query_id", how="left")
+
+    mfe_summary = load_mfeprimer_summary(args.mfeprimer_tsv)
+    if not mfe_summary.empty:
+        out = out.merge(mfe_summary, on="site_id", how="left")
+
+    fill_cols = [
         "human_offtarget_hits", "human_offtarget_best_pident", "human_offtarget_best_qcov",
         "human_offtarget_anchored_hits", "human_offtarget_best_anchored_pident", "human_offtarget_best_anchored_qcov",
         "human_offtarget_nearperfect_hits",
@@ -254,7 +411,8 @@ def main() -> None:
         "virus_bg_anchored_hits", "virus_bg_best_anchored_pident", "virus_bg_best_anchored_qcov",
         "virus_bg_nearperfect_hits",
         "mfeprimer_penalty", "mfeprimer_hits",
-    ]:
+    ]
+    for col in fill_cols:
         if col not in out.columns:
             out[col] = 0.0
         out[col] = out[col].fillna(0.0)
@@ -262,11 +420,21 @@ def main() -> None:
     out["offtarget_penalty"] = out.apply(lambda r: round(1.0 - specificity_score_from_row(r, args.assay_type), 6), axis=1)
     out["specificity_score"] = out.apply(lambda r: round(specificity_score_from_row(r, args.assay_type), 6), axis=1)
     out["specificity_assay_type"] = args.assay_type
+    out["specificity_query_count"] = len(unique_query_df)
+    out["specificity_deduplicated"] = (not args.no_deduplicate_queries)
+    out["specificity_max_target_seqs"] = args.max_target_seqs
+    out["specificity_ungapped"] = should_use_ungapped(args)
+
+    if "query_id" in out.columns:
+        out = out.drop(columns=["query_id"])
 
     Path(args.output_tsv).parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(args.output_tsv, sep="\t", index=False)
     print(f"Added specificity scores for {len(out)} candidates")
     print(f"Assay type: {args.assay_type}")
+    print(f"Unique query sequences searched: {len(unique_query_df)}")
+    print(f"BLAST max_target_seqs: {args.max_target_seqs}")
+    print(f"Ungapped mode: {should_use_ungapped(args)}")
     print(f"Wrote -> {args.output_tsv}")
 
 
