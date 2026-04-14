@@ -37,13 +37,6 @@ EMPTY_SUMMARY_COLUMNS = [
 ]
 
 
-def _clean_optional_string(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    sval = str(value).strip()
-    return sval if sval else None
-
-
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Score candidates for specificity")
     ap.add_argument("--candidates-tsv", required=True)
@@ -112,28 +105,35 @@ def validate_db_prefix(db: str) -> None:
         )
 
 
-def build_query_table(df: pd.DataFrame, deduplicate: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_query_table(df: pd.DataFrame, assay_type: str, deduplicate: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
     required = {"site_id", "sequence_ref"}
     if not required.issubset(df.columns):
         raise SystemExit(f"Candidates TSV must contain columns: {sorted(required)}")
     q = df[["site_id", "sequence_ref"]].copy()
-    q["sequence_ref"] = q["sequence_ref"].astype(str).str.upper()
-    q["query_len"] = q["sequence_ref"].str.len()
+    if assay_type == "rt_primer_25":
+        if "rt_primer_seq" not in df.columns:
+            q["rt_primer_seq"] = q["sequence_ref"].astype(str).str.upper().map(lambda s: str(Seq(s).reverse_complement()))
+        else:
+            q["rt_primer_seq"] = df["rt_primer_seq"].astype(str).str.upper()
+        q["query_seq"] = q["rt_primer_seq"]
+    else:
+        q["query_seq"] = q["sequence_ref"].astype(str).str.upper()
+    q["query_len"] = q["query_seq"].str.len()
     if deduplicate:
-        uniq = q[["sequence_ref", "query_len"]].drop_duplicates().reset_index(drop=True)
+        uniq = q[["query_seq", "query_len"]].drop_duplicates().reset_index(drop=True)
         uniq["query_id"] = [f"Q{i:06d}" for i in range(1, len(uniq) + 1)]
-        mapping = q.merge(uniq, on=["sequence_ref", "query_len"], how="left")
-        return mapping, uniq[["query_id", "sequence_ref", "query_len"]]
+        mapping = q.merge(uniq, on=["query_seq", "query_len"], how="left")
+        return mapping, uniq[["query_id", "query_seq", "query_len"]]
     else:
         q = q.copy()
         q["query_id"] = q["site_id"].astype(str)
-        return q[["site_id", "sequence_ref", "query_len", "query_id"]], q[["query_id", "sequence_ref", "query_len"]]
+        return q[["site_id", "query_seq", "query_len", "query_id"]], q[["query_id", "query_seq", "query_len"]]
 
 
 def write_query_fasta(query_df: pd.DataFrame, fasta_path: str) -> None:
     records = [
         SeqRecord(Seq(seq), id=str(qid), description="")
-        for qid, seq in zip(query_df["query_id"], query_df["sequence_ref"])
+        for qid, seq in zip(query_df["query_id"], query_df["query_seq"])
     ]
     Path(fasta_path).parent.mkdir(parents=True, exist_ok=True)
     SeqIO.write(records, fasta_path, "fasta")
@@ -153,7 +153,7 @@ def blast_cache_key(db: str, args: argparse.Namespace, query_df: pd.DataFrame) -
         "three_prime_anchor_nt": args.three_prime_anchor_nt,
         "ungapped": args.ungapped,
         "blast_perc_identity": args.blast_perc_identity,
-        "queries": list(zip(query_df["query_id"], query_df["sequence_ref"])),
+        "queries": list(zip(query_df["query_id"], query_df["query_seq"])),
     }
     raw = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:20]
@@ -364,12 +364,6 @@ def prepare_blast_tsv(
 
 def main() -> None:
     args = parse_args()
-    args.human_blast_db = _clean_optional_string(args.human_blast_db)
-    args.virus_blast_db = _clean_optional_string(args.virus_blast_db)
-    args.human_blast_tsv = _clean_optional_string(args.human_blast_tsv)
-    args.virus_blast_tsv = _clean_optional_string(args.virus_blast_tsv)
-    args.mfeprimer_tsv = _clean_optional_string(args.mfeprimer_tsv)
-    args.cache_dir = _clean_optional_string(args.cache_dir)
     df = pd.read_csv(args.candidates_tsv, sep="\t")
     if "site_id" not in df.columns or "sequence_ref" not in df.columns:
         raise SystemExit("Candidates TSV must contain site_id and sequence_ref")
@@ -377,7 +371,9 @@ def main() -> None:
     query_lengths = [len(str(s)) for s in df.get("sequence_ref", [])]
     resolve_defaults(args, query_lengths)
 
-    mapping_df, unique_query_df = build_query_table(df, deduplicate=not args.no_deduplicate_queries)
+    if args.assay_type == "rt_primer_25" and "rt_primer_seq" not in df.columns:
+        df["rt_primer_seq"] = df["sequence_ref"].astype(str).str.upper().map(lambda s: str(Seq(s).reverse_complement()))
+    mapping_df, unique_query_df = build_query_table(df, args.assay_type, deduplicate=not args.no_deduplicate_queries)
 
     human_blast_tsv = prepare_blast_tsv("human", args.human_blast_db, args.human_blast_tsv, unique_query_df, args)
     virus_blast_tsv = prepare_blast_tsv("virus", args.virus_blast_db, args.virus_blast_tsv, unique_query_df, args)
@@ -419,6 +415,8 @@ def main() -> None:
 
     out["offtarget_penalty"] = out.apply(lambda r: round(1.0 - specificity_score_from_row(r, args.assay_type), 6), axis=1)
     out["specificity_score"] = out.apply(lambda r: round(specificity_score_from_row(r, args.assay_type), 6), axis=1)
+    if args.assay_type == "rt_primer_25" and "rt_primer_seq" not in out.columns:
+        out["rt_primer_seq"] = out["sequence_ref"].astype(str).str.upper().map(lambda s: str(Seq(s).reverse_complement()))
     out["specificity_assay_type"] = args.assay_type
     out["specificity_query_count"] = len(unique_query_df)
     out["specificity_deduplicated"] = (not args.no_deduplicate_queries)

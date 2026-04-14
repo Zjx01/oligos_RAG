@@ -153,10 +153,12 @@ def compute_site_accessibility(start: int, end: int, unpaired_map: Dict[int, flo
     access_mean = sum(vals) / len(vals)
     access_min = min(vals)
 
-    terminal_start = end - u_length + 1
-    access_3p_terminal = float(unpaired_map.get(terminal_start, 0.0)) if terminal_start >= start else 0.0
+    # RT primer 3' end binds to the LEFT side of the target binding region.
+    terminal_start = start
+    access_3p_terminal = float(unpaired_map.get(terminal_start, 0.0)) if terminal_start <= end else 0.0
 
-    near_3p_starts = [pos for pos in valid_starts if pos >= max(start, end - u_length - three_prime_nt + 2)]
+    near_3p_limit = min(end - u_length + 1, start + max(three_prime_nt - u_length, 0))
+    near_3p_starts = [pos for pos in valid_starts if pos <= max(start, near_3p_limit)]
     if near_3p_starts:
         access_3p_near_mean = sum(float(unpaired_map.get(pos, 0.0)) for pos in near_3p_starts) / len(near_3p_starts)
     else:
@@ -172,6 +174,8 @@ def main() -> None:
     df = pd.read_csv(args.candidates_tsv, sep="\t")
     if "sequence_ref" not in df.columns or "start" not in df.columns or "end" not in df.columns:
         raise SystemExit("Candidates TSV must contain at least: start, end, sequence_ref")
+    if "rt_primer_seq" not in df.columns and args.assay_type == "rt_primer_25":
+        df["rt_primer_seq"] = df["sequence_ref"].astype(str).map(lambda s: clean_seq(s).translate(DNA_COMP)[::-1])
 
     source_mode = "heuristic_gc_placeholder"
     source_detail = "no_external_source"

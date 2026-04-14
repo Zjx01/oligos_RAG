@@ -69,10 +69,10 @@ def score_tm(tm: float, target: float, tolerance: float) -> float:
 
 def thermo_score(row: pd.Series, assay_type: str) -> float:
     if assay_type == "rt_primer_25":
-        gc_part = score_gc(float(row.get("gc", 0.0)), target=0.48, tolerance=0.18)
-        tm_part = score_tm(float(row.get("tm_est", 0.0)), target=60.0, tolerance=8.0)
-        clamp_part = clamp01(float(row.get("gc_3p5", 0)) / 3.0)
-        terminal_part = 1.0 if bool(row.get("terminal_is_gc", False)) else 0.7
+        gc_part = score_gc(float(row.get("rt_primer_gc", row.get("gc", 0.0))), target=0.48, tolerance=0.18)
+        tm_part = score_tm(float(row.get("rt_primer_tm", row.get("tm_est", 0.0))), target=60.0, tolerance=8.0)
+        clamp_part = clamp01(float(row.get("rt_primer_gc_3p5", row.get("gc_3p5", 0))) / 3.0)
+        terminal_part = 1.0 if bool(row.get("rt_primer_terminal_is_gc", row.get("terminal_is_gc", False))) else 0.7
         hp_penalty = min(float(row.get("three_prime_max_homopolymer", row.get("max_homopolymer", 0))), 5) / 5
         return clamp01(
             0.28 * gc_part
@@ -459,7 +459,7 @@ def first_pass_slot_selection(eligible: pd.DataFrame, slot_centers: List[float],
         selected_site_ids.add(str(chosen["site_id"]))
         cand = (int(chosen["start"]), int(chosen["end"]))
         selected_intervals.append(cand)
-        selected_seqs.append(str(chosen["sequence_ref"]))
+        selected_seqs.append(str(chosen["rt_primer_seq"] if "rt_primer_seq" in chosen else chosen["sequence_ref"]))
         selected_centers.append(float(chosen["center"]))
 
         rowd = chosen.to_dict()
@@ -477,7 +477,7 @@ def first_pass_slot_selection(eligible: pd.DataFrame, slot_centers: List[float],
             f"cross_penalty={cross_penalty:.3f}"
         )
         if args.assay_type == "rt_primer_25":
-            rowd["rt_primer_seq"] = revcomp(str(chosen["sequence_ref"]))
+            rowd["rt_primer_seq"] = str(chosen["rt_primer_seq"])
         selected_rows.append(rowd)
 
     return selected_rows, selected_site_ids, selected_intervals, selected_seqs, selected_centers
@@ -526,7 +526,7 @@ def second_pass_gap_fill(eligible: pd.DataFrame, slot_centers: List[float], targ
         selected_site_ids.add(str(chosen["site_id"]))
         cand = (int(chosen["start"]), int(chosen["end"]))
         selected_intervals.append(cand)
-        selected_seqs.append(str(chosen["sequence_ref"]))
+        selected_seqs.append(str(chosen["rt_primer_seq"] if "rt_primer_seq" in chosen else chosen["sequence_ref"]))
         selected_centers.append(float(chosen["center"]))
 
         rowd = chosen.to_dict()
@@ -545,7 +545,7 @@ def second_pass_gap_fill(eligible: pd.DataFrame, slot_centers: List[float], targ
             f"cross_penalty={cross_penalty:.3f}; largest_gap_before={current_largest_gap:.1f}"
         )
         if args.assay_type == "rt_primer_25":
-            rowd["rt_primer_seq"] = revcomp(str(chosen["sequence_ref"]))
+            rowd["rt_primer_seq"] = str(chosen["rt_primer_seq"])
         selected_rows.append(rowd)
 
     return selected_rows
@@ -608,6 +608,11 @@ def main() -> None:
             raise SystemExit("Input TSV must include start and end columns.")
 
     df["sequence_ref"] = df["sequence_ref"].astype(str).map(clean_seq)
+    if args.assay_type == "rt_primer_25":
+        if "rt_primer_seq" not in df.columns:
+            df["rt_primer_seq"] = df["sequence_ref"].astype(str).map(revcomp)
+        else:
+            df["rt_primer_seq"] = df["rt_primer_seq"].astype(str).map(clean_seq)
     if "length" not in df.columns:
         df["length"] = df["end"].astype(int) - df["start"].astype(int) + 1
     df["thermo_score"] = df.apply(lambda r: thermo_score(r, args.assay_type), axis=1)
