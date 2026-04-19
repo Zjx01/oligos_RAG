@@ -72,6 +72,8 @@ specificity:
 panel:
   max_sites: 24
   min_site_score: 0.56
+
+  # spacing / panel interaction
   min_gap: 250
   hard_min_gap: 40
   max_overlap_fraction: 0.20
@@ -86,11 +88,15 @@ panel:
   risky_match_fraction: 0.75
   hard_max_terminal_run: 7
   hard_max_run: 10
-  min_accessibility_score: 0.10
-  min_access_3p_terminal: 0.15
+
+  # hard cutoffs for conservation / accessibility
   min_robustness_score: 0.90
   min_cov_3p_1mm: 0.95
   min_cov_terminal_match: 0.95
+  min_accessibility_score: 0.10
+  min_access_3p_terminal: 0.15
+
+  # specificity hard cutoffs
   max_human_hits: 10
   max_human_anchored_hits: 0
   max_human_nearperfect_hits: 0
