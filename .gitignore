@@ -1,3 +1,4 @@
 /results
 .snakemake/
 slurm-*.out
+cache/
