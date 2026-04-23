@@ -26,11 +26,13 @@ PLUS_REF_FASTA = f"{ALN_DIR}/rsvb_plus_ref.fasta"
 PLUS_REF_ALN = f"{ALN_DIR}/rsvb_plus_ref.aln.fa"
 CANDIDATES_TSV = f"{CAND_DIR}/candidates.tsv"
 CONSERVATION_TSV = f"{CONS_DIR}/candidates.conservation.tsv"
+SELF_COMP_TSV    = f"{CONS_DIR}/candidates.self_comp.tsv"
 LUNP_FILE = f"{ACC_DIR}/{REF_ID}_lunp"
 ACCESS_TSV = f"{ACC_DIR}/candidates.access.tsv"
 SCORED_TSV = f"{SPEC_DIR}/candidates.scored.tsv"
 RANKED_TSV = f"{PANEL_DIR}/ranked.strict.tsv"
 PANEL_TSV = f"{PANEL_DIR}/panel.strict.tsv"
+SENSITIVITY_TSV = f"{PANEL_DIR}/weight_sensitivity.tsv"
 
 
 def bool_flag(value, flag):
@@ -62,9 +64,11 @@ rule all:
     input:
         PANEL_TSV,
         RANKED_TSV,
+        SENSITIVITY_TSV,
         SCORED_TSV,
         ACCESS_TSV,
         CONSERVATION_TSV,
+        SELF_COMP_TSV,
         CANDIDATES_TSV,
         PLUS_REF_ALN,
         LUNP_FILE,
@@ -248,9 +252,48 @@ rule rnaplfold:
         """
 
 
-rule score_accessibility:
+rule score_self_comp:
     input:
         cand=CONSERVATION_TSV,
+    output:
+        SELF_COMP_TSV,
+    log:
+        f"{LOG_DIR}/score_self_comp.log",
+    threads: 1
+    resources:
+        mem_mb=4000,
+        time_min=30,
+    conda:
+        "envs/python_bio.yaml"
+    params:
+        hard_max_body_run = lambda wc: config["self_comp"]["hard_max_body_run"],
+        hard_max_3p_run   = lambda wc: config["self_comp"]["hard_max_3p_run"],
+        warn_3p_run       = lambda wc: config["self_comp"]["warn_3p_run"],
+        safe_body_run     = lambda wc: config["self_comp"]["safe_body_run"],
+        risky_body_run    = lambda wc: config["self_comp"]["risky_body_run"],
+        safe_3p_run       = lambda wc: config["self_comp"]["safe_3p_run"],
+        risky_3p_run      = lambda wc: config["self_comp"]["risky_3p_run"],
+    shell:
+        r"""
+        mkdir -p {CONS_DIR} {LOG_DIR}
+        python scripts/score_self_comp.py \
+          --candidates-tsv {input.cand} \
+          --output-tsv {output} \
+          --assay-type {ASSAY} \
+          --hard-max-body-run {params.hard_max_body_run} \
+          --hard-max-3p-run   {params.hard_max_3p_run} \
+          --warn-3p-run       {params.warn_3p_run} \
+          --safe-body-run     {params.safe_body_run} \
+          --risky-body-run    {params.risky_body_run} \
+          --safe-3p-run       {params.safe_3p_run} \
+          --risky-3p-run      {params.risky_3p_run} \
+          > {log} 2>&1
+        """
+
+
+rule score_accessibility:
+    input:
+        cand=SELF_COMP_TSV,
         lunp=LUNP_FILE,
     output:
         ACCESS_TSV,
@@ -323,6 +366,7 @@ rule select_panel:
     output:
         ranked=RANKED_TSV,
         panel=PANEL_TSV,
+        sensitivity=SENSITIVITY_TSV,
     log:
         f"{LOG_DIR}/select_panel.log",
     threads: 1
@@ -331,6 +375,12 @@ rule select_panel:
         time_min=60,
     conda:
         "envs/python_bio.yaml"
+    params:
+        weight_robustness    = lambda wc: config["panel"]["weight_robustness"],
+        weight_accessibility = lambda wc: config["panel"]["weight_accessibility"],
+        weight_thermo        = lambda wc: config["panel"]["weight_thermo"],
+        weight_specificity   = lambda wc: config["panel"]["weight_specificity"],
+        weight_synthesis     = lambda wc: config["panel"]["weight_synthesis"],
     shell:
         r"""
         mkdir -p {PANEL_DIR} {LOG_DIR}
@@ -338,6 +388,7 @@ rule select_panel:
           --scored-tsv {input} \
           --ranked-output {output.ranked} \
           --panel-output {output.panel} \
+          --sensitivity-tsv {output.sensitivity} \
           --assay-type {ASSAY} \
           --max-sites {config[panel][max_sites]} \
           --min-site-score {config[panel][min_site_score]} \
@@ -364,5 +415,10 @@ rule select_panel:
           --max-human-anchored-hits {config[panel][max_human_anchored_hits]} \
           --max-human-nearperfect-hits {config[panel][max_human_nearperfect_hits]} \
           --max-virus-anchored-hits {config[panel][max_virus_anchored_hits]} \
+          --weight-robustness {params.weight_robustness} \
+          --weight-accessibility {params.weight_accessibility} \
+          --weight-thermo {params.weight_thermo} \
+          --weight-specificity {params.weight_specificity} \
+          --weight-synthesis {params.weight_synthesis} \
           > {log} 2>&1
         """
