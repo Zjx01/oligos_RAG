@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import math
 from pathlib import Path
 from typing import List, Tuple
 from Bio import SeqIO
@@ -30,11 +31,86 @@ def gc_frac(seq: str) -> float:
         return 0.0
     return (seq.count("G") + seq.count("C")) / len(seq)
 
-def wallace_tm(seq: str) -> float:
-    seq = clean_seq(seq)
-    at = seq.count("A") + seq.count("T")
-    gc = seq.count("G") + seq.count("C")
-    return 2 * at + 4 * gc
+# ---------------------------------------------------------------------------
+# Nearest-neighbour Tm (SantaLucia 1998, unified parameters).
+# Reference: SantaLucia J (1998) PNAS 95:1460-1465.
+# Conditions: 50 mM Na+, 250 nM oligo (default for primer design).
+# The Wallace rule (2*AT + 4*GC) is only valid for oligos ≤14 nt and
+# produces errors of 5-10 °C for 25-mers; NN is used instead.
+# ---------------------------------------------------------------------------
+_NN_DH: dict[str, float] = {          # kcal/mol
+    "AA": -7.9,  "TT": -7.9,
+    "AT": -7.2,  "TA": -7.2,
+    "CA": -8.5,  "TG": -8.5,
+    "GT": -8.4,  "AC": -8.4,
+    "CT": -7.8,  "AG": -7.8,
+    "GA": -8.2,  "TC": -8.2,
+    "CG": -10.6, "GC": -9.8,
+    "GG": -8.0,  "CC": -8.0,
+}
+_NN_DS: dict[str, float] = {          # cal/mol/K
+    "AA": -22.2, "TT": -22.2,
+    "AT": -20.4, "TA": -21.3,
+    "CA": -22.7, "TG": -22.7,
+    "GT": -22.4, "AC": -22.4,
+    "CT": -21.0, "AG": -21.0,
+    "GA": -22.2, "TC": -22.2,
+    "CG": -27.2, "GC": -24.4,
+    "GG": -19.9, "CC": -19.9,
+}
+_R = 1.987          # cal/mol/K
+_OLIGO_CONC = 250e-9   # 250 nM total strand
+_SALT_CONC   = 0.05    # 50 mM Na+
+
+def nn_tm(seq: str,
+          oligo_conc: float = _OLIGO_CONC,
+          salt_conc: float = _SALT_CONC) -> float:
+    """Nearest-neighbour Tm (°C) using SantaLucia 1998 parameters.
+
+    Falls back to Wallace rule only when the sequence contains ambiguity
+    codes that prevent NN lookup (rare for a cleaned reference window).
+    Salt correction applied via the empirical formula of Owczarzy 2004.
+    """
+    seq = clean_seq(seq).upper()
+    # Strip any non-ACGT before NN; if >20% ambiguous, fall back.
+    acgt = sum(seq.count(b) for b in "ACGT")
+    if acgt < len(seq) * 0.80 or len(seq) < 2:
+        at = seq.count("A") + seq.count("T")
+        gc = seq.count("G") + seq.count("C")
+        return float(2 * at + 4 * gc)  # Wallace fallback
+
+    dH = 0.0  # kcal/mol
+    dS = 0.0  # cal/mol/K
+
+    # Initiation parameters (SantaLucia 1998 Table 2)
+    for end_base in (seq[0], seq[-1]):
+        if end_base in "GC":
+            dH += 0.1;  dS += -2.8
+        else:                           # A or T
+            dH += 2.3;  dS += 4.1
+
+    for i in range(len(seq) - 1):
+        dinuc = seq[i:i+2]
+        if dinuc in _NN_DH:
+            dH += _NN_DH[dinuc]
+            dS += _NN_DS[dinuc]
+        else:
+            # Ambiguous dinucleotide — skip (conservative, minor effect)
+            pass
+
+    dH_cal = dH * 1000.0   # convert to cal/mol
+    # Tm in Kelvin (non-self-complementary duplex)
+    tm_k = dH_cal / (dS + _R * math.log(oligo_conc / 4.0))
+
+    # Salt correction (Owczarzy 2004, Eq. 22 — monovalent)
+    gc_frac_val = (seq.count("G") + seq.count("C")) / max(len(seq), 1)
+    ln_salt = math.log(salt_conc)
+    inv_tm_corr = (1.0 / tm_k) + (
+        (4.29 * gc_frac_val - 3.95) * 1e-5 * ln_salt
+        + 9.40e-6 * ln_salt ** 2
+    )
+    tm_celsius = (1.0 / inv_tm_corr) - 273.15
+    return round(tm_celsius, 2)
 
 def max_homopolymer(seq: str) -> int:
     seq = clean_seq(seq)
@@ -96,7 +172,7 @@ def main():
         primer_seq = revcomp(target_seq)
         term_base = primer_seq[-1]
         gc = gc_frac(primer_seq)
-        tm = wallace_tm(primer_seq)
+        tm = nn_tm(primer_seq)
         gc_3p5 = primer_seq[-5:].count("G") + primer_seq[-5:].count("C")
         three_prime_hp = max_homopolymer(primer_seq[-8:])
         hp = max_homopolymer(primer_seq)
