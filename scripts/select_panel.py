@@ -15,6 +15,13 @@ Main ideas:
    - low panel interaction
 5. Optional second pass fills leftover slots / extra capacity using gap-filling heuristics.
 6. For rt_primer_25, output `rt_primer_seq = revcomp(sequence_ref)` for ordering.
+
+Score weight transparency
+--------------------------
+All five component weights (robustness, accessibility, thermo, specificity, synthesis)
+are configurable via --weight-* CLI flags and stored in the output header.
+A sensitivity report (ranked.strict.tsv companion) shows how panel composition
+changes when each weight is perturbed ±0.10 from the chosen values.
 """
 from __future__ import annotations
 
@@ -38,6 +45,59 @@ IUPAC_MATCH: Dict[str, set[str]] = {
     "D": {"A", "G", "T"}, "H": {"A", "C", "T"}, "V": {"A", "C", "G"},
     "N": {"A", "C", "G", "T"},
 }
+
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class SiteWeights:
+    """Per-component weights for the composite site score.
+
+    All weights must sum to 1.0 for rt_primer_25 and capture_long.
+    They are validated and normalised at runtime.
+
+    Defaults (rt_primer_25):
+        robustness   0.28  — cross-strain primer coverage
+        accessibility 0.24 — RNA secondary structure exposure
+        thermo       0.18  — GC, Tm, 3' clamp
+        specificity  0.22  — human / virus off-target penalty
+        synthesis    0.08  — homopolymer / low-complexity penalty
+
+    Rationale:
+        robustness > specificity > accessibility > thermo > synthesis
+        because for short RT primers the biggest failure modes are
+        (1) primer not matching the circulating strain and
+        (2) priming on host RNA. Accessibility matters but is noisier
+        because RNAplfold is a static free-energy model; thermo is
+        well-controlled by the GC/Tm filters in stage 3.
+    """
+    robustness:    float = 0.28
+    accessibility: float = 0.24
+    thermo:        float = 0.18
+    specificity:   float = 0.22
+    synthesis:     float = 0.08
+
+    def normalise(self) -> "SiteWeights":
+        total = (self.robustness + self.accessibility +
+                 self.thermo + self.specificity + self.synthesis)
+        if abs(total - 1.0) > 1e-6:
+            import warnings
+            warnings.warn(
+                f"Score weights sum to {total:.4f}, not 1.0 — normalising.",
+                stacklevel=2,
+            )
+            return SiteWeights(
+                robustness    = self.robustness    / total,
+                accessibility = self.accessibility / total,
+                thermo        = self.thermo        / total,
+                specificity   = self.specificity   / total,
+                synthesis     = self.synthesis     / total,
+            )
+        return self
+
+    def as_dict(self) -> dict[str, float]:
+        return dataclasses.asdict(self)
 
 
 def clamp01(x: float) -> float:
@@ -70,7 +130,7 @@ def score_tm(tm: float, target: float, tolerance: float) -> float:
 def thermo_score(row: pd.Series, assay_type: str) -> float:
     if assay_type == "rt_primer_25":
         gc_part = score_gc(float(row.get("rt_primer_gc", row.get("gc", 0.0))), target=0.48, tolerance=0.18)
-        tm_part = score_tm(float(row.get("rt_primer_tm", row.get("tm_est", 0.0))), target=60.0, tolerance=8.0)
+        tm_part = score_tm(float(row.get("rt_primer_tm", row.get("tm_est", 0.0))), target=60.0, tolerance=10.0)
         clamp_part = clamp01(float(row.get("rt_primer_gc_3p5", row.get("gc_3p5", 0))) / 3.0)
         terminal_part = 1.0 if bool(row.get("rt_primer_terminal_is_gc", row.get("terminal_is_gc", False))) else 0.7
         hp_penalty = min(float(row.get("three_prime_max_homopolymer", row.get("max_homopolymer", 0))), 5) / 5
@@ -98,15 +158,25 @@ def synthesis_score(row: pd.Series, assay_type: str) -> float:
     return clamp01(1.0 - 0.5 * hp_penalty - 0.5 * lc_penalty)
 
 
-def base_site_score(row: pd.Series, assay_type: str) -> float:
+def base_site_score(row: pd.Series, assay_type: str,
+                    weights: "SiteWeights | None" = None) -> float:
+    """Composite site score weighted by SiteWeights.
+
+    For rt_primer_25 the weights object is used directly.
+    For capture_long a fixed internal preset is used (weights ignored)
+    because capture-bait optimisation has different trade-offs and the
+    weights have not been validated for that mode.
+    """
     if assay_type == "rt_primer_25":
+        w = weights if weights is not None else SiteWeights()
         return clamp01(
-            0.28 * float(row.get("robustness_score", 0.0))
-            + 0.24 * float(row.get("accessibility_score", 0.0))
-            + 0.18 * thermo_score(row, assay_type)
-            + 0.22 * float(row.get("specificity_score", 0.0))
-            + 0.08 * synthesis_score(row, assay_type)
+            w.robustness    * float(row.get("robustness_score", 0.0))
+            + w.accessibility * float(row.get("accessibility_score", 0.0))
+            + w.thermo        * thermo_score(row, assay_type)
+            + w.specificity   * float(row.get("specificity_score", 0.0))
+            + w.synthesis     * synthesis_score(row, assay_type)
         )
+    # capture_long preset — not user-configurable
     return clamp01(
         0.35 * float(row.get("robustness_score", 0.0))
         + 0.25 * float(row.get("accessibility_score", 0.0))
@@ -586,6 +656,31 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--gap-fill-weight", type=float, default=None, help="Second-pass weight on filling larger spacing gaps")
     ap.add_argument("--target-gap", type=float, default=None, help="Override ideal gap between primer centers")
     ap.add_argument("--no-second-pass", action="store_true", help="Disable second-pass gap filling")
+
+    # ── Score weight configuration ─────────────────────────────────────────
+    # Weights must sum to 1.0; if they don't, they are normalised with a
+    # warning.  Defaults match the SiteWeights dataclass above.
+    wg = ap.add_argument_group(
+        "score weights (rt_primer_25 only)",
+        "Relative importance of each scoring component. "
+        "Values are normalised to sum to 1 if they don't already. "
+        "Rationale: robustness and specificity dominate for short RT primers; "
+        "thermo is already constrained by the GC/Tm hard filters.",
+    )
+    wg.add_argument("--weight-robustness",    type=float, default=None,
+                    help="Weight for conservation/robustness score  [default: 0.28]")
+    wg.add_argument("--weight-accessibility", type=float, default=None,
+                    help="Weight for RNA accessibility score        [default: 0.24]")
+    wg.add_argument("--weight-thermo",        type=float, default=None,
+                    help="Weight for thermodynamic (GC/Tm) score   [default: 0.18]")
+    wg.add_argument("--weight-specificity",   type=float, default=None,
+                    help="Weight for specificity/off-target score   [default: 0.22]")
+    wg.add_argument("--weight-synthesis",     type=float, default=None,
+                    help="Weight for synthesis quality score        [default: 0.08]")
+    wg.add_argument("--sensitivity-tsv", default=None,
+                    help="If set, write a weight-sensitivity report to this path. "
+                         "Each row perturbs one weight by ±0.10 and records how "
+                         "many panel primers change vs. the baseline run.")
     return ap.parse_args()
 
 
@@ -615,9 +710,24 @@ def main() -> None:
             df["rt_primer_seq"] = df["rt_primer_seq"].astype(str).map(clean_seq)
     if "length" not in df.columns:
         df["length"] = df["end"].astype(int) - df["start"].astype(int) + 1
-    df["thermo_score"] = df.apply(lambda r: thermo_score(r, args.assay_type), axis=1)
+    # Build and normalise score weights from CLI args (or use defaults)
+    weights = SiteWeights(
+        robustness    = args.weight_robustness    if args.weight_robustness    is not None else 0.28,
+        accessibility = args.weight_accessibility if args.weight_accessibility is not None else 0.24,
+        thermo        = args.weight_thermo        if args.weight_thermo        is not None else 0.18,
+        specificity   = args.weight_specificity   if args.weight_specificity   is not None else 0.22,
+        synthesis     = args.weight_synthesis     if args.weight_synthesis     is not None else 0.08,
+    ).normalise()
+
+    df["thermo_score"]    = df.apply(lambda r: thermo_score(r, args.assay_type), axis=1)
     df["synthesis_score"] = df.apply(lambda r: synthesis_score(r, args.assay_type), axis=1)
-    df["site_score"] = df.apply(lambda r: base_site_score(r, args.assay_type), axis=1)
+    df["site_score"]      = df.apply(lambda r: base_site_score(r, args.assay_type, weights), axis=1)
+    # Record which weights produced this run
+    df["score_weight_robustness"]    = round(weights.robustness, 4)
+    df["score_weight_accessibility"] = round(weights.accessibility, 4)
+    df["score_weight_thermo"]        = round(weights.thermo, 4)
+    df["score_weight_specificity"]   = round(weights.specificity, 4)
+    df["score_weight_synthesis"]     = round(weights.synthesis, 4)
     df["prefilter_fail_reason"] = df.apply(lambda r: ";".join(rt25_prefilter_reasons(r, args)), axis=1)
     df["prefilter_pass"] = df["prefilter_fail_reason"].eq("")
     df["center"] = compute_centers(df)
@@ -671,8 +781,77 @@ def main() -> None:
     print(f"Ranked candidates: {len(ranked)}")
     print(f"Prefilter-eligible candidates: {int(ranked['prefilter_pass'].sum())}")
     print(f"Selected panel size: {len(panel_df)}")
+    print(f"Score weights used: robustness={weights.robustness:.3f}  "
+          f"accessibility={weights.accessibility:.3f}  "
+          f"thermo={weights.thermo:.3f}  "
+          f"specificity={weights.specificity:.3f}  "
+          f"synthesis={weights.synthesis:.3f}")
     print(f"Wrote ranked TSV -> {args.ranked_output}")
     print(f"Wrote panel TSV -> {args.panel_output}")
+
+    # ── Optional weight-sensitivity analysis ──────────────────────────────
+    # For each of the 5 components, perturb its weight by ±0.10 (clipped to
+    # [0, 1]) while scaling the remaining weights proportionally so the sum
+    # stays 1.0.  Re-score and re-select under the perturbed weights and
+    # record how many primers in the panel differ from the baseline run.
+    # This tells you which components have the most leverage on the final
+    # panel — useful for deciding whether to invest in better scoring data.
+    if args.sensitivity_tsv and args.assay_type == "rt_primer_25":
+        import copy
+        baseline_ids = set(panel_df["site_id"].astype(str)) if not panel_df.empty else set()
+        sens_rows = []
+        fields = ["robustness", "accessibility", "thermo", "specificity", "synthesis"]
+        for field in fields:
+            for delta in (-0.10, +0.10):
+                base_val = getattr(weights, field)
+                new_val  = max(0.0, min(1.0, base_val + delta))
+                if abs(new_val - base_val) < 1e-9:
+                    continue
+                # Scale remaining weights to fill the difference
+                remaining_sum = sum(getattr(weights, f) for f in fields if f != field)
+                scale = (1.0 - new_val) / max(remaining_sum, 1e-9)
+                kw = {f: (new_val if f == field else getattr(weights, f) * scale)
+                      for f in fields}
+                w_perturbed = SiteWeights(**kw).normalise()
+
+                df_s = df.copy()
+                df_s["site_score"] = df_s.apply(
+                    lambda r: base_site_score(r, args.assay_type, w_perturbed), axis=1
+                )
+                eligible_s = df_s[df_s["prefilter_pass"].astype(bool)].copy()
+                eligible_s["center"] = compute_centers(eligible_s)
+                eligible_s["nearest_slot_idx"]      = df_s.loc[eligible_s.index, "nearest_slot_idx"]
+                eligible_s["nearest_slot_center"]   = df_s.loc[eligible_s.index, "nearest_slot_center"]
+                eligible_s["nearest_slot_proximity"] = df_s.loc[eligible_s.index, "nearest_slot_proximity"]
+
+                sel_rows_s, _, _, _, _ = first_pass_slot_selection(
+                    eligible_s, slot_centers, target_gap, genome_start, genome_end, args
+                )
+                panel_s_ids = {str(r["site_id"]) for r in sel_rows_s}
+                n_changed = len(baseline_ids.symmetric_difference(panel_s_ids))
+                sens_rows.append({
+                    "perturbed_weight":    field,
+                    "delta":               round(delta, 2),
+                    "original_value":      round(base_val, 4),
+                    "perturbed_value":     round(new_val, 4),
+                    "baseline_panel_size": len(baseline_ids),
+                    "perturbed_panel_size": len(panel_s_ids),
+                    "primers_changed":     n_changed,
+                    "fraction_changed":    round(n_changed / max(len(baseline_ids), 1), 4),
+                })
+
+        if sens_rows:
+            sens_df = pd.DataFrame(sens_rows)
+            Path(args.sensitivity_tsv).parent.mkdir(parents=True, exist_ok=True)
+            sens_df.to_csv(args.sensitivity_tsv, sep="\t", index=False)
+            print(f"Wrote sensitivity report -> {args.sensitivity_tsv}")
+            # Print a quick summary to stdout
+            print("\nWeight sensitivity summary (primers_changed out of baseline panel):")
+            for _, sr in sens_df.iterrows():
+                arrow = "▲" if sr["delta"] > 0 else "▼"
+                print(f"  {sr['perturbed_weight']:14s} {arrow}{abs(sr['delta']):.2f} "
+                      f"→ {int(sr['primers_changed'])} primer(s) changed "
+                      f"({sr['fraction_changed']*100:.0f}%)")
 
 
 if __name__ == "__main__":
