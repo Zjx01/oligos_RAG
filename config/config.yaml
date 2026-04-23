@@ -28,8 +28,8 @@ candidates:
   max_homopolymer: 4
   max_low_complexity: 0.80
   low_complexity_k: 3
-  min_tm: 52
-  max_tm: 66
+  min_tm: 56    # NN-Tm (SantaLucia 1998), 50 mM Na+, 250 nM oligo
+  max_tm: 64    # NN-Tm upper bound
   min_gc_3p5: 1
   max_gc_3p5: 4
   max_3p_homopolymer: 3
@@ -37,6 +37,24 @@ candidates:
 
 conservation:
   three_prime_nt: 8
+
+self_comp:
+  # Thresholds for the score_self_comp.py stage (stage 4.5).
+  # Candidates are annotated with a flag (ok / warn / fail) — they are NOT
+  # automatically dropped.  Inspect candidates.self_comp.tsv and tighten
+  # the hard-max thresholds in select_panel if your panel contains flagged
+  # primers.
+  #
+  # Whole-body self-RC run (hairpin stem or self-dimer body):
+  hard_max_body_run: 7   # run > this → fail  (7 bp stem in a 25-mer is very risky)
+  safe_body_run:     4   # run ≤ this → zero body penalty
+  risky_body_run:    7   # run ≥ this → maximum body penalty
+  #
+  # 3'-anchored self-RC run (blocks polymerase initiation):
+  hard_max_3p_run:   4   # run > this → fail  (4 bp 3'-stem stops RT extension)
+  warn_3p_run:       3   # run ≥ this → warn  (3 bp is borderline)
+  safe_3p_run:       3   # run ≤ this → zero 3' penalty
+  risky_3p_run:      5   # run ≥ this → maximum 3' penalty
 
 accessibility:
   rnaplfold_bin: RNAplfold
@@ -101,3 +119,14 @@ panel:
   max_human_anchored_hits: 0
   max_human_nearperfect_hits: 0
   max_virus_anchored_hits: 0
+
+
+  # ── Composite site-score weights (rt_primer_25) ──────────────────────
+  # Must sum to 1.0 (normalised automatically with a warning if not).
+  # Rationale: robustness & specificity dominate failure risk for short
+  # RT primers; thermo is pre-constrained by GC/Tm hard filters in stage 3.
+  weight_robustness:    0.28
+  weight_accessibility: 0.24
+  weight_thermo:        0.18
+  weight_specificity:   0.22
+  weight_synthesis:     0.08
